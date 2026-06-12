@@ -310,7 +310,7 @@ export default function App() {
       const res = await fetch('/api/hint', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ word: selectedWord.key, clue_en: selectedWord.clue_en }),
+        body: JSON.stringify({ word: selectedWord.key, clue_en: selectedWord.clue_en, clue_es: selectedWord.clue_es, language: clueMode }),
       });
       const data = await res.json();
       setHintText(data.hint || '');
