@@ -266,32 +266,38 @@ export default function App() {
       // Call API (up to 2 attempts)
       let words = null;
       let violations = Infinity;
+      let lastErr = null;
 
       for (let attempt = 0; attempt < 2; attempt++) {
         if (attempt > 0) setLoadMsg('Refining the grid…');
-        const res = await fetch('/api/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ slots, crossings, csvWords }),
-        });
-        const data = await res.json();
-        if (!data.words) throw new Error('No words in response');
+        try {
+          const res = await fetch('/api/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slots, crossings, csvWords }),
+          });
+          const data = await res.json();
+          if (data.error) { lastErr = new Error(data.error); continue; }
+          if (!data.words) { lastErr = new Error('No words returned from API'); continue; }
 
-        // Normalize keys (strip accents)
-        const normalized = {};
-        for (const [id, w] of Object.entries(data.words)) {
-          normalized[id] = {
-            ...w,
-            key: stripAccents(w.key || w.spanish || ''),
-          };
+          // Normalize keys (strip accents)
+          const normalized = {};
+          for (const [id, w] of Object.entries(data.words)) {
+            normalized[id] = {
+              ...w,
+              key: stripAccents(w.key || w.spanish || ''),
+            };
+          }
+
+          const v = countViolations(crossings, normalized);
+          if (v < violations) { violations = v; words = normalized; }
+          if (violations === 0) break;
+        } catch (e) {
+          lastErr = e;
         }
-
-        const v = countViolations(crossings, normalized);
-        if (v < violations) { violations = v; words = normalized; }
-        if (violations === 0) break;
       }
 
-      if (!words) throw new Error('Could not generate puzzle');
+      if (!words) throw lastErr || new Error('Could not generate puzzle');
 
       setLoadMsg('Building grid…');
 
@@ -316,7 +322,7 @@ export default function App() {
       if (first) setSel({ r: first.row, c: first.col, dir: first.dir });
       setActiveTab(enrichedAcross.length ? 'A' : 'D');
     } catch (e) {
-      setError('Could not generate puzzle — please try again.');
+      setError(`Error: ${e.message || 'Unknown error'} — please try again.`);
       console.error(e);
     } finally {
       setLoading(false); setLoadMsg('');
