@@ -1,94 +1,149 @@
-export default async function handler(req, res) {
+// CommonJS — safer for Vercel Node.js runtime
+const https = require('https');
+
+module.exports = async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { slots, crossings, csvWords = [] } = req.body;
-  if (!slots?.length) return res.status(400).json({ error: 'No slots provided' });
+  const { slots = [], crossings = [], csvWords = [] } = req.body || {};
+  if (!slots.length) return res.status(400).json({ error: 'No slots provided' });
 
   const aSlots = slots.filter(s => s.dir === 'A').sort((a, b) => a.number - b.number);
   const dSlots = slots.filter(s => s.dir === 'D').sort((a, b) => a.number - b.number);
 
-  // Build slot descriptions
-  const slotLines = [
-    'ACROSS:',
-    ...aSlots.map(s => `  ${s.id} (${s.length} letters): row ${s.row}, cols ${s.col}–${s.col + s.length - 1}`),
-    'DOWN:',
-    ...dSlots.map(s => `  ${s.id} (${s.length} letters): col ${s.col}, rows ${s.row}–${s.row + s.length - 1}`),
-  ].join('\n');
+  const lengthCount = {};
+  for (const s of slots) lengthCount[s.length] = (lengthCount[s.length] || 0) + 1;
+  const lengthSummary = Object.entries(lengthCount).sort(([a],[b])=>a-b)
+    .map(([len, n]) => `${n}×${len}-letter`).join(', ');
 
-  const crossingLines = crossings.length
-    ? crossings.map(c => `  ${c.aId}[${c.aPos}] = ${c.dId}[${c.dPos}]   ← cell (row ${c.row}, col ${c.col})`).join('\n')
-    : '  (none)';
+  const vocabList = csvWords.length > 0
+    ? `PRIORITY WORDS (use these when they fit):\n${csvWords.slice(0,40).map(w=>`  ${w.spanish} = ${w.english}`).join('\n')}`
+    : 'Use common beginner Spanish vocabulary (animals, food, home, travel, nature, verbs).';
 
-  const vocabSection = csvWords.length > 0
-    ? `PRIORITY VOCABULARY — use these words wherever they fit the length and letter constraints:\n${
-        csvWords.slice(0, 40).map(w =>
-          `  "${w.spanish}"${w.definition ? ` — ${w.definition}` : ''} (EN: ${w.english})`
-        ).join('\n')
-      }`
-    : 'Use common beginner-friendly Spanish vocabulary: everyday nouns, simple verbs, adjectives (food, home, animals, nature, travel).';
+  // ── Phase 1: fill ACROSS slots (no crossing constraints) ────
+  const acrossLines = aSlots.map(s =>
+    `  ${s.id} (${s.length} letters, row ${s.row})`
+  ).join('\n');
 
-  const lengthSummary = [...new Set(slots.map(s => s.length))].sort((a, b) => a - b)
-    .map(len => `${len}-letter: ${slots.filter(s => s.length === len).length} slots`)
-    .join(', ');
+  const prompt1 = `Fill these Spanish crossword ACROSS slots. Each needs a real Spanish word of the exact length shown. Strip all accents (use a-z only for "key"; keep accents in "spanish" for display).
 
-  const prompt = `You are constructing a Spanish crossword puzzle. Fill every slot with a real Spanish word, satisfying all crossing constraints.
+SLOTS:
+${acrossLines}
 
-WORD SLOTS (${slots.length} total — ${lengthSummary}):
-${slotLines}
+${vocabList}
 
-CROSSING CONSTRAINTS (letter at each crossing cell must match EXACTLY):
-${crossingLines}
-
-${vocabSection}
-
-RULES:
-1. Strip accents — use only a–z lowercase (árbol→arbol, café→cafe, gato→gato)
-2. Word length must EXACTLY match each slot
-3. Every crossing constraint must be satisfied — if A1[2] = D5[0], the letter at position 2 of A1's word must equal the letter at position 0 of D5's word
-4. Words must be real Spanish vocabulary
-
-HOW TO APPROACH:
-- Start with the longest slots (they're most constrained)
-- For each slot, pick a word whose letters satisfy all crossing constraints with already-placed words
-- After placing all words, verify each crossing is satisfied
-
-For clues: clue_en is a short English crossword-style clue; clue_es is a short Spanish definition. The "spanish" field may include accents (for display); "key" must be a–z only (for the grid).
-
-Return ONLY valid JSON — no markdown, no extra text:
+Return ONLY valid JSON:
 {
   "words": {
-    "A1": { "key": "gato", "spanish": "gato", "clue_en": "Feline that purrs", "clue_es": "Animal doméstico felino" },
-    "D1": { "key": "gas", "spanish": "gas", "clue_en": "Cooking fuel", "clue_es": "Combustible gaseoso" }
+    "A1": { "key": "gato", "spanish": "gato", "clue_en": "Feline pet", "clue_es": "Animal doméstico" },
+    "A3": { "key": "mesa", "spanish": "mesa", "clue_en": "Dining surface", "clue_es": "Mueble para comer" }
   }
 }`;
 
+  let acrossWords;
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 3500,
-        messages: [{ role: 'user', content: prompt }],
-      }),
+    const r1 = await callClaude(prompt1);
+    acrossWords = r1.words || {};
+  } catch (e) {
+    console.error('Phase 1 error:', e.message);
+    return res.status(500).json({ error: `Phase 1 failed: ${e.message}` });
+  }
+
+  // ── Build fixed-letter map from across words ─────────────────
+  const fixed = {}; // "row,col" -> letter
+  for (const as of aSlots) {
+    const word = acrossWords[as.id];
+    if (!word?.key) continue;
+    for (let i = 0; i < word.key.length && i < as.length; i++) {
+      fixed[`${as.row},${as.col + i}`] = word.key[i];
+    }
+  }
+
+  // ── Phase 2: fill DOWN slots using fixed letters as patterns ─
+  const downLines = dSlots.map(s => {
+    const pattern = Array.from({ length: s.length }, (_, i) => {
+      const letter = fixed[`${s.row + i},${s.col}`];
+      return letter ? letter : '_';
+    }).join('');
+    const constraints = Array.from({ length: s.length }, (_, i) => {
+      const letter = fixed[`${s.row + i},${s.col}`];
+      return letter ? `pos ${i}='${letter}'` : null;
+    }).filter(Boolean).join(', ');
+    return `  ${s.id} (${s.length} letters, col ${s.col}): pattern "${pattern}"${constraints ? ` [${constraints}]` : ''}`;
+  }).join('\n');
+
+  const prompt2 = `Fill these Spanish crossword DOWN slots. Each must exactly match the letter pattern shown (letters shown must appear at those positions; "_" means you choose).
+
+SLOTS:
+${downLines}
+
+${vocabList}
+
+IMPORTANT: The letters shown in each pattern MUST appear at exactly those positions. For example, pattern "ca_a" means a 4-letter word starting with "ca" and ending with "a" — like "cama" or "cara".
+
+Strip all accents (key: a-z only; spanish: keep accents for display).
+
+Return ONLY valid JSON:
+{
+  "words": {
+    "D1": { "key": "cama", "spanish": "cama", "clue_en": "Sleeping furniture", "clue_es": "Mueble para dormir" }
+  }
+}`;
+
+  let downWords;
+  try {
+    const r2 = await callClaude(prompt2);
+    downWords = r2.words || {};
+  } catch (e) {
+    console.error('Phase 2 error:', e.message);
+    // Don't fail completely — return what we have with empty down words
+    downWords = {};
+  }
+
+  const allWords = { ...acrossWords, ...downWords };
+  return res.json({ words: allWords });
+};
+
+// ── Anthropic API call ────────────────────────────────────────
+function callClaude(prompt) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: prompt }],
     });
 
-    const data = await response.json();
-    if (data.error) throw new Error(data.error.message);
+    const options = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
 
-    const text = data.content[0].text;
-    const parsed = extractJSON(text);
-    if (!parsed.words) throw new Error('No words in response');
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) return reject(new Error(parsed.error.message || JSON.stringify(parsed.error)));
+          const text = parsed.content?.[0]?.text || '';
+          resolve(extractJSON(text));
+        } catch (e) {
+          reject(new Error(`Parse error: ${e.message} — raw: ${data.slice(0, 200)}`));
+        }
+      });
+    });
 
-    res.json(parsed);
-  } catch (e) {
-    console.error('Generate error:', e);
-    res.status(500).json({ error: e.message });
-  }
+    req.on('error', reject);
+    req.setTimeout(25000, () => { req.destroy(); reject(new Error('Request timeout')); });
+    req.write(body);
+    req.end();
+  });
 }
 
 function extractJSON(text) {
@@ -97,5 +152,9 @@ function extractJSON(text) {
     .replace(/,\s*([\]}])/g, '$1')
     .replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"');
   try { return JSON.parse(s); }
-  catch { const m = s.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error('Could not parse JSON'); }
+  catch {
+    const m = s.match(/\{[\s\S]*\}/);
+    if (m) { try { return JSON.parse(m[0]); } catch {} }
+    throw new Error('Could not parse JSON from response');
+  }
 }
