@@ -1,4 +1,7 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useMemo } from 'react';
+import { TEMPLATES } from './templates.js';
+import { buildIndex, solve, prepareWords } from './solver.js';
+import RAW_WORDS from './wordlist.json';
 
 // ── Tokens ────────────────────────────────────────────────────
 const T = {
@@ -11,50 +14,6 @@ const T = {
 
 // ── Grid size ─────────────────────────────────────────────────
 const GS = 9;
-
-// ── 9×9 Templates (0=white, 1=black, all 180° rotationally symmetric) ──
-const TEMPLATES = [
-  // T1 — Classic: two corner clusters, open rows
-  [ [0,0,0,1,0,0,0,0,0],
-    [0,0,0,1,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0],
-    [1,1,1,0,0,0,0,0,0],
-    [0,0,0,0,1,0,0,0,0],
-    [0,0,0,0,0,0,1,1,1],
-    [0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,1,0,0,0],
-    [0,0,0,0,0,1,0,0,0] ],
-  // T2 — T1 flipped L-R
-  [ [0,0,0,0,0,1,0,0,0],
-    [0,0,0,0,0,1,0,0,0],
-    [0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,1,1,1],
-    [0,0,0,0,1,0,0,0,0],
-    [1,1,1,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0],
-    [0,0,0,1,0,0,0,0,0],
-    [0,0,0,1,0,0,0,0,0] ],
-  // T3 — Diamond: edge walls, open diagonals
-  [ [0,0,0,0,1,0,0,0,0],
-    [0,0,0,1,0,1,0,0,0],
-    [0,0,0,0,0,0,0,0,0],
-    [1,0,0,0,0,0,0,0,1],
-    [1,0,0,0,1,0,0,0,1],
-    [1,0,0,0,0,0,0,0,1],
-    [0,0,0,0,0,0,0,0,0],
-    [0,0,0,1,0,1,0,0,0],
-    [0,0,0,0,1,0,0,0,0] ],
-  // T4 — T1 rotated 90°
-  [ [0,0,0,0,0,1,0,0,0],
-    [0,0,0,0,0,1,0,0,0],
-    [0,0,0,0,0,1,0,0,0],
-    [0,0,0,0,0,0,0,1,1],
-    [0,0,0,0,1,0,0,0,0],
-    [1,1,0,0,0,0,0,0,0],
-    [0,0,0,1,0,0,0,0,0],
-    [0,0,0,1,0,0,0,0,0],
-    [0,0,0,1,0,0,0,0,0] ],
-];
 
 // ── Crossword geometry ────────────────────────────────────────
 
@@ -110,25 +69,6 @@ function computeSlots(template) {
   };
 }
 
-function computeCrossings(slots) {
-  const crossings = [];
-  const aSlots = slots.filter(s => s.dir === 'A');
-  const dSlots = slots.filter(s => s.dir === 'D');
-  for (const a of aSlots) {
-    for (const d of dSlots) {
-      if (d.col >= a.col && d.col < a.col + a.length &&
-          a.row >= d.row && a.row < d.row + d.length) {
-        crossings.push({
-          aId: a.id, aPos: d.col - a.col,
-          dId: d.id, dPos: a.row - d.row,
-          row: a.row, col: d.col,
-        });
-      }
-    }
-  }
-  return crossings;
-}
-
 function buildSolutionGrid(template, slots, words) {
   const grid = Array(GS).fill(null).map(() => Array(GS).fill(null));
   // Fill from across words first, then down (across takes precedence at conflicts)
@@ -146,16 +86,6 @@ function buildSolutionGrid(template, slots, words) {
     }
   }
   return grid;
-}
-
-function countViolations(crossings, words) {
-  let n = 0;
-  for (const c of crossings) {
-    const a = (words[c.aId]?.key || '')[c.aPos];
-    const d = (words[c.dId]?.key || '')[c.dPos];
-    if (a && d && a !== d) n++;
-  }
-  return n;
 }
 
 // ── CSV Parsing ───────────────────────────────────────────────
@@ -199,7 +129,7 @@ export default function App() {
   const [puzzle,      setPuzzle]      = useState(null);
   const [userGrid,    setUserGrid]    = useState(null);
   const [sel,         setSel]         = useState({ r: null, c: null, dir: 'A' });
-  const [clueMode,    setClueMode]    = useState('EN');
+  const [clueMode,    setClueMode]    = useState('ES');
   const [peekEN,      setPeekEN]      = useState(false);
   const [loading,     setLoading]     = useState(false);
   const [loadMsg,     setLoadMsg]     = useState('');
@@ -213,9 +143,47 @@ export default function App() {
   const [hintText,    setHintText]    = useState('');
   const [hintLoading, setHintLoading] = useState(false);
   const [completed,   setCompleted]   = useState(false);
+  const [cluesLoading, setCluesLoading] = useState(false);
 
   const inputRef = useRef(null);
   const fileRef  = useRef(null);
+
+  // ── Word list & index ────────────────────────────────────────
+  // The bundled list is prepared (filtered to 3–9 letters, a–z keys) and
+  // indexed for fast pattern lookup. CSV uploads are merged into the pool
+  // so the user's own words can actually be placed (and prioritized).
+  const baseWords = useMemo(() => prepareWords(RAW_WORDS, 9), []);
+
+  const allWords = useMemo(() => {
+    if (csvWords.length === 0) return baseWords;
+    const have = new Set(baseWords.map(w => w.key));
+    const extra = [];
+    for (const w of csvWords) {
+      const key = stripAccents(w.spanish);
+      if (key.length < 3 || key.length > 9) continue;
+      if (have.has(key)) continue;
+      have.add(key);
+      extra.push({
+        key,
+        spanish: w.spanish,
+        english: w.english || '',
+        source: 'student',
+        length: key.length,
+      });
+    }
+    return extra.length ? [...baseWords, ...extra] : baseWords;
+  }, [baseWords, csvWords]);
+
+  const wordIndex = useMemo(() => buildIndex(allWords), [allWords]);
+
+  // Student words (bundled + uploaded) are the priority/theme layer.
+  const csvPriorityKeys = useMemo(() => {
+    const keys = new Set();
+    for (const w of allWords) {
+      if (w.source === 'student') keys.add(w.key);
+    }
+    return keys;
+  }, [allWords]);
 
   // ── Derived ──────────────────────────────────────────────────
   const inSlot = (s, r, c) => {
@@ -250,83 +218,132 @@ export default function App() {
 
   // ── Generate ─────────────────────────────────────────────────
   const generatePuzzle = async () => {
-    setLoading(true); setLoadMsg('Picking template…');
+    setLoading(true); setLoadMsg('Building grid…');
     setError(''); setChecked(false); setRevealed(new Set());
     setHintText(''); setPeekEN(false); setCompleted(false);
     setPuzzle(null); setUserGrid(null);
 
     try {
-      // Pick random template
-      const template = TEMPLATES[Math.floor(Math.random() * TEMPLATES.length)];
-      const { slots, cellNums, across, down } = computeSlots(template);
-      const crossings = computeCrossings(slots);
+      // ── Step 1: solve a grid locally (fast, reliable) ──────────
+      // Try templates in random order; each solve has internal restarts,
+      // so a single failure is rare, but we fall through to another
+      // template just in case.
+      const order = [...TEMPLATES.keys()].sort(() => Math.random() - 0.5);
+      let chosen = null;
 
-      setLoadMsg('Generating Spanish words…');
-
-      // Call API (up to 2 attempts)
-      let words = null;
-      let violations = Infinity;
-      let lastErr = null;
-
-      for (let attempt = 0; attempt < 2; attempt++) {
-        if (attempt > 0) setLoadMsg('Refining the grid…');
-        try {
-          const res = await fetch('/api/generate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ slots, crossings, csvWords }),
-          });
-          const data = await res.json();
-          if (data.error) { lastErr = new Error(data.error); continue; }
-          if (!data.words) { lastErr = new Error('No words returned from API'); continue; }
-
-          // Normalize keys (strip accents)
-          const normalized = {};
-          for (const [id, w] of Object.entries(data.words)) {
-            normalized[id] = {
-              ...w,
-              key: stripAccents(w.key || w.spanish || ''),
-            };
-          }
-
-          const v = countViolations(crossings, normalized);
-          if (v < violations) { violations = v; words = normalized; }
-          if (violations === 0) break;
-        } catch (e) {
-          lastErr = e;
+      for (const ti of order) {
+        const template = TEMPLATES[ti];
+        const { slots, cellNums, across, down } = computeSlots(template);
+        const priorityKeys = csvPriorityKeys; // student/CSV words to favor
+        const result = solve(slots, wordIndex, { priorityKeys, maxMs: 2500 });
+        if (result.ok) {
+          chosen = { template, slots, cellNums, across, down, assignment: result.assignment };
+          break;
         }
+        // brief yield so the loading text can paint between attempts
+        await new Promise(r => setTimeout(r, 0));
       }
 
-      if (!words) throw lastErr || new Error('Could not generate puzzle');
+      if (!chosen) throw new Error('Could not fill a grid — try again');
 
-      setLoadMsg('Building grid…');
+      const { template, slots, cellNums, across, down, assignment } = chosen;
 
-      // Attach clues to slots
+      // ── Step 2: build the solution grid from the assignment ────
+      const wordsById = {};
+      for (const s of slots) {
+        const w = assignment[s.id];
+        wordsById[s.id] = {
+          key: w.key,
+          spanish: w.spanish || w.key,
+          english: w.english || '',
+        };
+      }
+      const solution = buildSolutionGrid(template, slots, wordsById);
+
+      // ── Step 3: show the playable grid immediately ─────────────
+      // Clues fill in a moment later (Step 4), so the user sees the
+      // puzzle right away rather than waiting on the network.
       const enrichedSlots = slots.map(s => ({
         ...s,
-        clue_en:  words[s.id]?.clue_en || '—',
-        clue_es:  words[s.id]?.clue_es || '—',
-        spanish:  words[s.id]?.spanish || words[s.id]?.key || '',
-        key:      words[s.id]?.key || '',
+        key: wordsById[s.id].key,
+        spanish: wordsById[s.id].spanish,
+        english: wordsById[s.id].english,
+        clue_en: '…',
+        clue_es: '…',
       }));
+      const enrichedAcross = enrichedSlots.filter(s => s.dir === 'A').sort((a, b) => a.number - b.number);
+      const enrichedDown   = enrichedSlots.filter(s => s.dir === 'D').sort((a, b) => a.number - b.number);
 
-      const solution = buildSolutionGrid(template, enrichedSlots, words);
-
-      const enrichedAcross = enrichedSlots.filter(s => s.dir === 'A').sort((a,b) => a.number - b.number);
-      const enrichedDown   = enrichedSlots.filter(s => s.dir === 'D').sort((a,b) => a.number - b.number);
-
-      setPuzzle({ template, solution, slots: enrichedSlots, cellNums, across: enrichedAcross, down: enrichedDown, violations });
+      setPuzzle({ template, solution, slots: enrichedSlots, cellNums, across: enrichedAcross, down: enrichedDown });
       setUserGrid(Array(GS).fill(null).map(() => Array(GS).fill('')));
-
       const first = enrichedAcross[0] ?? enrichedDown[0];
       if (first) setSel({ r: first.row, c: first.col, dir: first.dir });
       setActiveTab(enrichedAcross.length ? 'A' : 'D');
+      setLoading(false); setLoadMsg('');
+
+      // ── Step 4: fetch clues for the placed words (background) ───
+      setCluesLoading(true);
+      try {
+        const wordsForClues = enrichedSlots.map(s => ({
+          id: s.id,
+          spanish: s.spanish,
+          english: s.english,
+        }));
+        const res = await fetch('/api/clues', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ words: wordsForClues }),
+        });
+        const data = await res.json();
+        if (data.clues) {
+          setPuzzle(prev => {
+            if (!prev) return prev;
+            const apply = sl => sl.map(s => ({
+              ...s,
+              clue_en: data.clues[s.id]?.clue_en || s.english || s.spanish,
+              clue_es: data.clues[s.id]?.clue_es || s.spanish,
+            }));
+            const merged = apply(prev.slots);
+            return {
+              ...prev,
+              slots: merged,
+              across: merged.filter(s => s.dir === 'A').sort((a, b) => a.number - b.number),
+              down:   merged.filter(s => s.dir === 'D').sort((a, b) => a.number - b.number),
+            };
+          });
+        } else {
+          fallbackClues();
+        }
+      } catch {
+        fallbackClues();
+      } finally {
+        setCluesLoading(false);
+      }
     } catch (e) {
-      setError(`Error: ${e.message || 'Unknown error'} — please try again.`);
+      setError(e.message || 'Could not generate puzzle — please try again.');
       console.error(e);
-    } finally {
       setLoading(false); setLoadMsg('');
     }
+  };
+
+  // If the clue API is unavailable, fall back to using the English gloss
+  // (or the word itself) so the puzzle is still playable.
+  const fallbackClues = () => {
+    setPuzzle(prev => {
+      if (!prev) return prev;
+      const apply = sl => sl.map(s => ({
+        ...s,
+        clue_en: s.english || `(${s.spanish})`,
+        clue_es: s.spanish,
+      }));
+      const merged = apply(prev.slots);
+      return {
+        ...prev,
+        slots: merged,
+        across: merged.filter(s => s.dir === 'A').sort((a, b) => a.number - b.number),
+        down:   merged.filter(s => s.dir === 'D').sort((a, b) => a.number - b.number),
+      };
+    });
   };
 
   // ── Interaction ───────────────────────────────────────────────
@@ -344,17 +361,85 @@ export default function App() {
     inputRef.current?.focus();
   };
 
+  // Is every cell of a slot filled in the given grid?
+  const isSlotFilled = (s, grid) => {
+    for (let i = 0; i < s.length; i++) {
+      const r = s.dir === 'A' ? s.row : s.row + i;
+      const c = s.dir === 'A' ? s.col + i : s.col;
+      if (!grid[r]?.[c]) return false;
+    }
+    return true;
+  };
+
+  // Find the next empty cell within a slot, starting at fromIdx.
+  // Wraps to the start of the word so a late gap still gets filled.
+  const nextEmptyInSlot = (s, grid, fromIdx) => {
+    for (let i = fromIdx; i < s.length; i++) {
+      const r = s.dir === 'A' ? s.row : s.row + i;
+      const c = s.dir === 'A' ? s.col + i : s.col;
+      if (!grid[r]?.[c]) return i;
+    }
+    for (let i = 0; i < fromIdx; i++) {
+      const r = s.dir === 'A' ? s.row : s.row + i;
+      const c = s.dir === 'A' ? s.col + i : s.col;
+      if (!grid[r]?.[c]) return i;
+    }
+    return -1; // word is full
+  };
+
+  // Ordered list of all slots: across (by number) then down (by number).
+  const orderedSlots = () => [
+    ...puzzle.across,
+    ...puzzle.down,
+  ];
+
+  // Find the next slot after the current one that still has empty cells.
+  // Wraps around. Returns null if every slot is complete.
+  const nextIncompleteSlot = (current, grid) => {
+    const all = orderedSlots();
+    const startIdx = all.findIndex(s => s.id === current.id);
+    for (let k = 1; k <= all.length; k++) {
+      const cand = all[(startIdx + k) % all.length];
+      if (!isSlotFilled(cand, grid)) return cand;
+    }
+    return null;
+  };
+
+  // Move the cursor to the first empty cell of a slot (or its start).
+  const goToSlot = (s, grid) => {
+    setPeekEN(false); // new word → English peek resets
+    setActiveTab(s.dir); // keep the clue list showing the active direction
+    const idx = Math.max(0, nextEmptyInSlot(s, grid, 0));
+    const r = s.dir === 'A' ? s.row : s.row + idx;
+    const c = s.dir === 'A' ? s.col + idx : s.col;
+    setSel({ r, c, dir: s.dir });
+  };
+
   const enterLetter = ch => {
     if (!selectedSlot || sel.r === null) return;
     const s = selectedSlot;
     const ng = userGrid.map(r => [...r]);
     ng[sel.r][sel.c] = ch;
     setUserGrid(ng); setChecked(false);
-    if (isPuzzleComplete(puzzle.solution, ng)) setCompleted(true);
+    setPeekEN(false); // a fresh letter dismisses the English peek
+
+    if (isPuzzleComplete(puzzle.solution, ng)) { setCompleted(true); return; }
+
     const idx = s.dir === 'A' ? sel.c - s.col : sel.r - s.row;
-    if (idx < s.length - 1) {
-      if (s.dir === 'A') setSel(x => ({ ...x, c: s.col + idx + 1 }));
-      else               setSel(x => ({ ...x, r: s.row + idx + 1 }));
+
+    // If this letter completed the word, jump to the next incomplete clue.
+    if (isSlotFilled(s, ng)) {
+      const next = nextIncompleteSlot(s, ng);
+      if (next) goToSlot(next, ng);
+      return;
+    }
+
+    // Otherwise advance to the next EMPTY cell in this word (skip filled).
+    const nextIdx = nextEmptyInSlot(s, ng, idx + 1);
+    if (nextIdx !== -1) {
+      const r = s.dir === 'A' ? s.row : s.row + nextIdx;
+      const c = s.dir === 'A' ? s.col + nextIdx : s.col;
+      setSel(x => ({ ...x, r, c }));
     }
   };
 
@@ -386,6 +471,55 @@ export default function App() {
     }
     setRevealed(newRev); setUserGrid(ng);
     if (isPuzzleComplete(puzzle.solution, ng)) setCompleted(true);
+  };
+
+  // Step to the next / previous clue in reading order (across then down).
+  const stepClue = (dir) => {
+    if (!puzzle || !selectedSlot) return;
+    const all = orderedSlots();
+    const i = all.findIndex(s => s.id === selectedSlot.id);
+    if (i === -1) return;
+    const next = all[(i + (dir === 'next' ? 1 : -1) + all.length) % all.length];
+    goToSlot(next, userGrid);
+    inputRef.current?.focus();
+  };
+
+  // Flip across/down on the current cell, if it belongs to both.
+  const toggleDirection = () => {
+    if (sel.r === null) return;
+    const hasA = puzzle.slots.some(s => s.dir === 'A' && inSlot(s, sel.r, sel.c));
+    const hasD = puzzle.slots.some(s => s.dir === 'D' && inSlot(s, sel.r, sel.c));
+    if (hasA && hasD) { setPeekEN(false); setSel(s => ({ ...s, dir: s.dir === 'A' ? 'D' : 'A' })); }
+  };
+
+  // Move one cell in an arrow direction, staying on white cells.
+  const moveCursor = (dr, dc) => {
+    if (sel.r === null) return;
+    let r = sel.r + dr, c = sel.c + dc;
+    while (r >= 0 && r < GS && c >= 0 && c < GS) {
+      if (puzzle.template[r][c] === 0) {
+        const dir = dr !== 0 ? 'D' : 'A';
+        const hasDir = puzzle.slots.some(s => s.dir === dir && inSlot(s, r, c));
+        setPeekEN(false);
+        setSel({ r, c, dir: hasDir ? dir : sel.dir });
+        return;
+      }
+      r += dr; c += dc;
+    }
+  };
+
+  const handleKeyDown = (e) => {
+    if (!puzzle) return;
+    switch (e.key) {
+      case 'Backspace': e.preventDefault(); deleteLetter(); break;
+      case ' ':         e.preventDefault(); toggleDirection(); break;
+      case 'Tab':       e.preventDefault(); stepClue(e.shiftKey ? 'prev' : 'next'); break;
+      case 'ArrowUp':   e.preventDefault(); moveCursor(-1, 0); break;
+      case 'ArrowDown': e.preventDefault(); moveCursor(1, 0); break;
+      case 'ArrowLeft': e.preventDefault(); moveCursor(0, -1); break;
+      case 'ArrowRight':e.preventDefault(); moveCursor(0, 1); break;
+      default: break;
+    }
   };
 
   const getHint = async () => {
@@ -423,9 +557,12 @@ export default function App() {
   const vw = Math.min(typeof window !== 'undefined' ? window.innerWidth : 390, 480);
   const cellPx = Math.floor((vw - 16) / GS);
 
-  const showingEN   = clueMode === 'EN' || peekEN;
+  // Spanish is the default. The English clue shows only while peeking on
+  // this word (a deliberate, per-word assist that resets on clue change).
+  const showingEN   = peekEN;
   const bannerClue  = hintText || (selectedSlot ? (showingEN ? selectedSlot.clue_en : selectedSlot.clue_es) : null);
   const bannerLabel = hintText ? '💡 Hint' : selectedSlot ? `${selectedSlot.number} ${selectedSlot.dir === 'A' ? 'Across' : 'Down'}` : null;
+  const hasEnglish  = selectedSlot && selectedSlot.clue_en && selectedSlot.clue_en !== '…';
 
   // ── Render ────────────────────────────────────────────────────
   return (
@@ -435,7 +572,7 @@ export default function App() {
       <input ref={inputRef} type="text" inputMode="text" autoCapitalize="characters" autoCorrect="off" autoComplete="off" spellCheck={false}
         value={inputVal}
         onChange={e => { const ch=e.target.value.slice(-1).toUpperCase(); if (/[A-Z]/.test(ch)) enterLetter(ch); setInputVal(''); }}
-        onKeyDown={e => { if (e.key==='Backspace') { e.preventDefault(); deleteLetter(); } }}
+        onKeyDown={handleKeyDown}
         style={{ position:'fixed', top:0, left:0, width:1, height:1, opacity:0.01, fontSize:16, border:'none', padding:0, pointerEvents:'none' }}
       />
 
@@ -446,8 +583,8 @@ export default function App() {
           <div style={{ fontSize:11, color:T.muted, fontFamily:'sans-serif' }}>Spanish Vocabulary Crossword</div>
         </div>
         <div style={{ display:'flex', gap:6, alignItems:'center', flexWrap:'wrap', justifyContent:'flex-end' }}>
-          <Btn onClick={() => { setClueMode(m => m==='EN'?'ES':'EN'); setPeekEN(false); }}>
-            {clueMode === 'EN' ? '🇺🇸 EN' : '🇲🇽 ES'}
+          <Btn onClick={() => setClueMode(m => m==='EN'?'ES':'EN')}>
+            {clueMode === 'EN' ? 'List: EN' : 'List: ES'}
           </Btn>
           <Btn onClick={() => fileRef.current?.click()}>
             {csvWords.length ? `📋 ${csvWords.length}w` : '📤 CSV'}
@@ -468,19 +605,32 @@ export default function App() {
       )}
 
       {/* ── Clue banner ── */}
-      <div style={{ minHeight:56, padding:'8px 14px', background:T.card, borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:8, flexShrink:0 }}>
+      <div style={{ minHeight:56, padding:'8px 10px', background:T.card, borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:6, flexShrink:0 }}>
         {bannerClue ? (
           <>
-            <span style={{ color:T.accent, fontWeight:700, fontSize:12, flexShrink:0, fontFamily:'sans-serif', minWidth:58 }}>{bannerLabel}</span>
-            <span style={{ fontSize:14, lineHeight:1.4, flex:1 }}>{bannerClue}</span>
-            {clueMode === 'ES' && !hintText && selectedSlot && (
-              <button onClick={() => setPeekEN(p => !p)} style={{ flexShrink:0, background:peekEN?T.accent:T.surface, color:peekEN?T.black:T.muted, border:`1px solid ${T.border}`, borderRadius:12, padding:'4px 9px', fontSize:11, cursor:'pointer', fontFamily:'sans-serif', whiteSpace:'nowrap' }}>
-                {peekEN ? '🇲🇽 ES' : '🇺🇸 EN?'}
+            {/* Prev clue */}
+            <button onClick={() => stepClue('prev')} aria-label="Previous clue"
+              style={{ flexShrink:0, background:'none', border:'none', color:T.muted, fontSize:22, lineHeight:1, cursor:'pointer', padding:'0 4px' }}>‹</button>
+
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ color:T.accent, fontWeight:700, fontSize:11, fontFamily:'sans-serif', marginBottom:1 }}>{bannerLabel}{showingEN && !hintText ? ' · EN' : ''}</div>
+              <div style={{ fontSize:14, lineHeight:1.35 }}>{bannerClue}</div>
+            </div>
+
+            {/* English peek — Spanish-first, tap to reveal English for this word */}
+            {!hintText && hasEnglish && (
+              <button onClick={() => setPeekEN(p => !p)} aria-label="Toggle English hint"
+                style={{ flexShrink:0, background:peekEN?T.accent:T.surface, color:peekEN?T.black:T.muted, border:`1px solid ${T.border}`, borderRadius:12, padding:'5px 10px', fontSize:11, fontWeight:600, cursor:'pointer', fontFamily:'sans-serif', whiteSpace:'nowrap' }}>
+                {peekEN ? 'Hide' : 'EN hint'}
               </button>
             )}
+
+            {/* Next clue */}
+            <button onClick={() => stepClue('next')} aria-label="Next clue"
+              style={{ flexShrink:0, background:'none', border:'none', color:T.muted, fontSize:22, lineHeight:1, cursor:'pointer', padding:'0 4px' }}>›</button>
           </>
         ) : (
-          <span style={{ color:T.muted, fontSize:13, fontFamily:'sans-serif' }}>
+          <span style={{ color:T.muted, fontSize:13, fontFamily:'sans-serif', padding:'0 4px' }}>
             {puzzle ? 'Tap a cell to begin' : 'Generate a puzzle to start playing'}
           </span>
         )}
@@ -541,6 +691,12 @@ export default function App() {
       {/* ── Clue lists ── */}
       {puzzle && !loading && (
         <div style={{ flex:1, overflowY:'auto', paddingBottom:20 }}>
+          {cluesLoading && (
+            <div style={{ padding:'7px 14px', background:T.card, borderBottom:`1px solid ${T.border}`, fontSize:12, color:T.muted, fontFamily:'sans-serif', display:'flex', alignItems:'center', gap:8 }}>
+              <span>✍️ Writing clues…</span>
+              <span style={{ fontSize:11 }}>the grid is ready to solve now</span>
+            </div>
+          )}
           <div style={{ display:'flex', background:T.surface, borderBottom:`1px solid ${T.border}` }}>
             {['A','D'].map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab)} style={{ flex:1, padding:'10px 0', background:'transparent', border:'none', borderBottom:`2px solid ${activeTab===tab?T.accent:'transparent'}`, color:activeTab===tab?T.accent:T.muted, cursor:'pointer', fontFamily:'sans-serif', fontSize:13, fontWeight:activeTab===tab?700:400 }}>
@@ -550,11 +706,12 @@ export default function App() {
           </div>
           {(activeTab==='A'?puzzle.across:puzzle.down).map(s => {
             const isActive = selectedSlot===s;
+            const done = userGrid && isSlotFilled(s, userGrid);
             return (
-              <div key={s.id} onClick={() => { setSel({r:s.row,c:s.col,dir:s.dir}); inputRef.current?.focus(); }}
-                style={{ padding:'9px 14px', display:'flex', gap:10, alignItems:'flex-start', background:isActive?T.card:'transparent', borderLeft:`3px solid ${isActive?T.accent:'transparent'}`, borderBottom:`1px solid ${T.border}`, cursor:'pointer' }}>
+              <div key={s.id} onClick={() => { goToSlot(s, userGrid); inputRef.current?.focus(); }}
+                style={{ padding:'9px 14px', display:'flex', gap:10, alignItems:'flex-start', background:isActive?T.card:'transparent', borderLeft:`3px solid ${isActive?T.accent:'transparent'}`, borderBottom:`1px solid ${T.border}`, cursor:'pointer', opacity:done && !isActive ? 0.45 : 1 }}>
                 <span style={{ color:T.accent, fontWeight:700, fontSize:13, minWidth:22, flexShrink:0, fontFamily:'sans-serif' }}>{s.number}</span>
-                <span style={{ fontSize:14, lineHeight:1.4 }}>{clueMode==='EN'?s.clue_en:s.clue_es}</span>
+                <span style={{ fontSize:14, lineHeight:1.4, textDecoration:done?'line-through':'none', textDecorationColor:T.muted }}>{clueMode==='EN'?s.clue_en:s.clue_es}</span>
               </div>
             );
           })}
