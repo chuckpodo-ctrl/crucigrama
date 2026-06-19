@@ -88,48 +88,11 @@ function buildSolutionGrid(template, slots, words) {
   return grid;
 }
 
-// ── CSV Parsing ───────────────────────────────────────────────
-function parseCSVLine(line) {
-  const cols = []; let cur = '', inQ = false;
-  for (const ch of line) {
-    if (ch === '"') { inQ = !inQ; }
-    else if (ch === ',' && !inQ) { cols.push(cur.trim()); cur = ''; }
-    else { cur += ch; }
-  }
-  cols.push(cur.trim());
-  return cols;
-}
-
-const stripAccents = s =>
-  s.toLowerCase().replace(/[áàâä]/g,'a').replace(/[éèêë]/g,'e').replace(/[íìîï]/g,'i').replace(/[óòôö]/g,'o').replace(/[úùûü]/g,'u').replace(/ñ/g,'n').replace(/[^a-z]/g,'');
-
-function parseVocabCSV(text) {
-  const lines = text.split('\n').filter(l => l.trim());
-  if (lines.length < 2) return { words: [], error: 'File appears empty' };
-  const headers = parseCSVLine(lines[0]).map(h => h.trim());
-  const spanishIdx = headers.findIndex(h => /^(spanish\s*(phrase|word|marker)|infinitive|interrogative)/i.test(h));
-  const englishIdx = headers.findIndex(h => /english/i.test(h));
-  const defIdx     = headers.findIndex(h => /spanish\s*definition/i.test(h));
-  if (spanishIdx === -1 || englishIdx === -1) return { words: [], error: `Could not detect columns. Found: ${headers.slice(0,4).join(', ')}` };
-  const seen = new Set(); const words = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = parseCSVLine(lines[i]);
-    const spanish = cols[spanishIdx]?.trim(), english = cols[englishIdx]?.trim();
-    const definition = defIdx >= 0 ? cols[defIdx]?.trim() : '';
-    if (!spanish || !english) continue;
-    const key = stripAccents(spanish);
-    if (key.length < 3 || key.length > 9 || key.includes(' ') || seen.has(key)) continue;
-    seen.add(key); words.push({ spanish, english, definition });
-  }
-  return { words, error: '' };
-}
-
 // ── App ───────────────────────────────────────────────────────
 export default function App() {
   const [puzzle,      setPuzzle]      = useState(null);
   const [userGrid,    setUserGrid]    = useState(null);
   const [sel,         setSel]         = useState({ r: null, c: null, dir: 'A' });
-  const [clueMode,    setClueMode]    = useState('ES');
   const [peekEN,      setPeekEN]      = useState(false);
   const [loading,     setLoading]     = useState(false);
   const [loadMsg,     setLoadMsg]     = useState('');
@@ -138,52 +101,27 @@ export default function App() {
   const [revealed,    setRevealed]    = useState(new Set());
   const [inputVal,    setInputVal]    = useState('');
   const [activeTab,   setActiveTab]   = useState('A');
-  const [csvWords,    setCsvWords]    = useState([]);
-  const [csvStatus,   setCsvStatus]   = useState('');
   const [hintText,    setHintText]    = useState('');
   const [hintLoading, setHintLoading] = useState(false);
   const [completed,   setCompleted]   = useState(false);
   const [cluesLoading, setCluesLoading] = useState(false);
 
   const inputRef = useRef(null);
-  const fileRef  = useRef(null);
 
   // ── Word list & index ────────────────────────────────────────
   // The bundled list is prepared (filtered to 3–9 letters, a–z keys) and
-  // indexed for fast pattern lookup. CSV uploads are merged into the pool
-  // so the user's own words can actually be placed (and prioritized).
+  // indexed for fast pattern lookup.
   const baseWords = useMemo(() => prepareWords(RAW_WORDS, 9), []);
+  const wordIndex = useMemo(() => buildIndex(baseWords), [baseWords]);
 
-  const allWords = useMemo(() => {
-    if (csvWords.length === 0) return baseWords;
-    const have = new Set(baseWords.map(w => w.key));
-    const extra = [];
-    for (const w of csvWords) {
-      const key = stripAccents(w.spanish);
-      if (key.length < 3 || key.length > 9) continue;
-      if (have.has(key)) continue;
-      have.add(key);
-      extra.push({
-        key,
-        spanish: w.spanish,
-        english: w.english || '',
-        source: 'student',
-        length: key.length,
-      });
-    }
-    return extra.length ? [...baseWords, ...extra] : baseWords;
-  }, [baseWords, csvWords]);
-
-  const wordIndex = useMemo(() => buildIndex(allWords), [allWords]);
-
-  // Student words (bundled + uploaded) are the priority/theme layer.
-  const csvPriorityKeys = useMemo(() => {
+  // Student words from the bundled list are the priority/theme layer.
+  const priorityKeys = useMemo(() => {
     const keys = new Set();
-    for (const w of allWords) {
+    for (const w of baseWords) {
       if (w.source === 'student') keys.add(w.key);
     }
     return keys;
-  }, [allWords]);
+  }, [baseWords]);
 
   // ── Derived ──────────────────────────────────────────────────
   const inSlot = (s, r, c) => {
@@ -196,25 +134,6 @@ export default function App() {
     if (s.dir !== sel.dir || sel.r === null) return false;
     return inSlot(s, sel.r, sel.c);
   }) ?? null;
-
-  // ── CSV ──────────────────────────────────────────────────────
-  const handleCSV = e => {
-    const file = e.target.files?.[0]; if (!file) return; e.target.value = '';
-    const reader = new FileReader();
-    reader.onload = ev => {
-      const { words, error: parseErr } = parseVocabCSV(ev.target.result);
-      if (parseErr) { setCsvStatus(`⚠️ ${parseErr}`); setTimeout(() => setCsvStatus(''), 5000); return; }
-      setCsvWords(prev => {
-        const existing = new Set(prev.map(w => stripAccents(w.spanish)));
-        const newWords = words.filter(w => !existing.has(stripAccents(w.spanish)));
-        const total = prev.length + newWords.length;
-        setCsvStatus(`✓ ${newWords.length} added · ${total} total`);
-        setTimeout(() => setCsvStatus(''), 4000);
-        return [...prev, ...newWords];
-      });
-    };
-    reader.readAsText(file);
-  };
 
   // ── Generate ─────────────────────────────────────────────────
   const generatePuzzle = async () => {
@@ -234,7 +153,6 @@ export default function App() {
       for (const ti of order) {
         const template = TEMPLATES[ti];
         const { slots, cellNums, across, down } = computeSlots(template);
-        const priorityKeys = csvPriorityKeys; // student/CSV words to favor
         const result = solve(slots, wordIndex, { priorityKeys, maxMs: 2500 });
         if (result.ok) {
           chosen = { template, slots, cellNums, across, down, assignment: result.assignment };
@@ -529,7 +447,7 @@ export default function App() {
       const res = await fetch('/api/hint', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ word: selectedSlot.key, clue_en: selectedSlot.clue_en, clue_es: selectedSlot.clue_es, language: clueMode }),
+        body: JSON.stringify({ word: selectedSlot.key, clue_en: selectedSlot.clue_en, clue_es: selectedSlot.clue_es, language: 'ES' }),
       });
       const data = await res.json();
       setHintText(data.hint || '');
@@ -582,27 +500,7 @@ export default function App() {
           <div style={{ fontSize:19, fontWeight:700 }}>🧩 El Crucigrama</div>
           <div style={{ fontSize:11, color:T.muted, fontFamily:'sans-serif' }}>Spanish Vocabulary Crossword</div>
         </div>
-        <div style={{ display:'flex', gap:6, alignItems:'center', flexWrap:'wrap', justifyContent:'flex-end' }}>
-          <Btn onClick={() => setClueMode(m => m==='EN'?'ES':'EN')}>
-            {clueMode === 'EN' ? 'List: EN' : 'List: ES'}
-          </Btn>
-          <Btn onClick={() => fileRef.current?.click()}>
-            {csvWords.length ? `📋 ${csvWords.length}w` : '📤 CSV'}
-          </Btn>
-          {csvWords.length > 0 && (
-            <button onClick={() => { setCsvWords([]); setCsvStatus('Cleared'); setTimeout(()=>setCsvStatus(''),2000); }}
-              style={{ background:'none', border:'none', color:T.muted, cursor:'pointer', fontSize:16, padding:'4px 2px' }}>✕</button>
-          )}
-          <input ref={fileRef} type="file" accept=".csv" onChange={handleCSV} style={{ display:'none' }} />
-        </div>
       </div>
-
-      {/* CSV status */}
-      {csvStatus && (
-        <div style={{ padding:'6px 14px', background:csvStatus.startsWith('⚠️')?'#3a1a1a':'#1a3a1a', borderBottom:`1px solid ${T.border}`, fontSize:12, fontFamily:'sans-serif', color:csvStatus.startsWith('⚠️')?'#ffa0a0':'#a0ffa0', flexShrink:0 }}>
-          {csvStatus}
-        </div>
-      )}
 
       {/* ── Clue banner ── */}
       <div style={{ minHeight:56, padding:'8px 10px', background:T.card, borderBottom:`1px solid ${T.border}`, display:'flex', alignItems:'center', gap:6, flexShrink:0 }}>
@@ -648,7 +546,7 @@ export default function App() {
             <div style={{ fontSize:48, marginBottom:14 }}>🧩</div>
             <div style={{ fontSize:17, marginBottom:6 }}>¡Hola! Ready to practice?</div>
             <div style={{ color:T.muted, fontSize:13, fontFamily:'sans-serif', marginBottom:22, lineHeight:1.6 }}>
-              {csvWords.length ? `${csvWords.length} words from your vocab list` : 'Upload your CSV or use default beginner vocabulary'}
+              Generate a puzzle from your vocabulary list
             </div>
             <button onClick={generatePuzzle} style={bigBtnStyle}>Generate Puzzle</button>
             {error && <div style={{ marginTop:14, color:T.red, fontSize:13, fontFamily:'sans-serif' }}>{error}</div>}
@@ -711,7 +609,7 @@ export default function App() {
               <div key={s.id} onClick={() => { goToSlot(s, userGrid); inputRef.current?.focus(); }}
                 style={{ padding:'9px 14px', display:'flex', gap:10, alignItems:'flex-start', background:isActive?T.card:'transparent', borderLeft:`3px solid ${isActive?T.accent:'transparent'}`, borderBottom:`1px solid ${T.border}`, cursor:'pointer', opacity:done && !isActive ? 0.45 : 1 }}>
                 <span style={{ color:T.accent, fontWeight:700, fontSize:13, minWidth:22, flexShrink:0, fontFamily:'sans-serif' }}>{s.number}</span>
-                <span style={{ fontSize:14, lineHeight:1.4, textDecoration:done?'line-through':'none', textDecorationColor:T.muted }}>{clueMode==='EN'?s.clue_en:s.clue_es}</span>
+                <span style={{ fontSize:14, lineHeight:1.4, textDecoration:done?'line-through':'none', textDecorationColor:T.muted }}>{s.clue_es}</span>
               </div>
             );
           })}
